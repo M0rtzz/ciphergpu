@@ -1,0 +1,34 @@
+[project]
+name = "ciphergpu"
+version = "0.1.0"
+description = "Confidential GPU execution agent"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=45.0.0,<47",
+  "fastapi>=0.116.0,<1",
+  "httpx>=0.28.0,<1",
+  "pyhpke>=0.6.4,<0.7",
+  "pynacl>=1.5.0,<2",
+  "rfc8785>=0.1.4,<0.2",
+  "uvicorn[standard]>=0.35.0,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.4.0,<9",
+  "ruff>=0.12.0,<1",
+]
+
+[project.scripts]
+ciphergpu = "ciphergpu.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
