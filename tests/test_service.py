@@ -215,6 +215,25 @@ def test_openai_compatible_deployment_requires_authorization_then_activates() ->
     assert offline.json()["status"] == "OFFLINE"
 
 
+def test_offline_model_deployment_is_idempotent_after_agent_restart() -> None:
+    service = ConfidentialExecutionService(EvidenceSigner(Ed25519PrivateKey.generate()))
+    client = TestClient(create_app(service))
+
+    offline = client.post("/v1/model-deployments/deploy-missing/offline")
+
+    assert offline.status_code == 200
+    assert offline.json() == {
+        "deploymentId": "deploy-missing",
+        "securityProfile": "a100-sim",
+        "simulated": True,
+        "status": "OFFLINE",
+        "sessionId": None,
+        "errorCode": None,
+        "alreadyAbsent": True,
+        "sessionKeysDestroyed": True,
+    }
+
+
 def test_model_connector_denies_private_and_non_https_urls() -> None:
     client, _ = fixture()
     template = {

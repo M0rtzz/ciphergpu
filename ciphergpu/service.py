@@ -195,7 +195,18 @@ class ConfidentialExecutionService:
         with self._lock:
             deployment = self._model_deployments.get(deployment_id)
             if deployment is None:
-                raise CipherGpuError("MODEL_DEPLOYMENT_NOT_FOUND", "model deployment was not registered", 404)
+                # Deployments and their unsealed secrets are intentionally ephemeral. After an
+                # agent restart, an absent deployment is already in the requested safe state.
+                return {
+                    "deploymentId": deployment_id,
+                    "securityProfile": "a100-sim",
+                    "simulated": True,
+                    "status": "OFFLINE",
+                    "sessionId": None,
+                    "errorCode": None,
+                    "alreadyAbsent": True,
+                    "sessionKeysDestroyed": True,
+                }
             self._clear_deployment_secret(deployment)
             deployment.status = "OFFLINE"
             deployment.session_id = None
