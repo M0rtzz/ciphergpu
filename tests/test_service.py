@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from types import SimpleNamespace
 from datetime import UTC, datetime, timedelta
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -15,6 +17,7 @@ from ciphergpu.crypto import (
     EvidenceSigner,
     b64u,
     canonical,
+    content_seal,
     hpke_seal,
     new_hpke_key_pair,
     sha256,
@@ -28,7 +31,8 @@ def iso(value: datetime) -> str:
 
 
 def fixture(
-    scenario: str = "NORMAL", workload_id: str = "builtin.digest/v1", chunk_count: int = 1
+    scenario: str = "NORMAL", workload_id: str = "builtin.digest/v1", chunk_count: int = 1,
+    envelope_v2: bool = False,
 ) -> tuple[TestClient, dict]:
     service = ConfidentialExecutionService(EvidenceSigner(Ed25519PrivateKey.generate()))
     client = TestClient(create_app(service))
@@ -97,10 +101,15 @@ def fixture(
         input_aad = {"assetVersionId": "asset-1@v1", "chunkIndex": chunk_index}
         nonce = os.urandom(12)
         plaintext = f"confidential input {chunk_index}".encode()
-        ciphertext = AESGCM(dek).encrypt(nonce, plaintext, canonical(input_aad))
+        envelope_id = "env-stream-test"
+        ciphertext = (content_seal(dek, envelope_id, "AES-256-GCM", nonce, plaintext, input_aad)
+                      if envelope_v2 else AESGCM(dek).encrypt(nonce, plaintext, canonical(input_aad)))
         encrypted_inputs.append(
             {
                 "assetVersionId": "asset-1@v1",
+                "format": "ds-envelope/v2" if envelope_v2 else "ds-envelope/v1",
+                "envelopeId": envelope_id if envelope_v2 else None,
+                "implementationVersion": "1",
                 "algorithm": "AES-256-GCM",
                 "nonce": b64u(nonce),
                 "aad": input_aad,
@@ -232,6 +241,102 @@ def test_offline_model_deployment_is_idempotent_after_agent_restart() -> None:
         "alreadyAbsent": True,
         "sessionKeysDestroyed": True,
     }
+
+
+def test_authorized_model_stream_decrypts_in_order_and_starts_runtime(tmp_path: Path) -> None:
+    client, request = fixture(workload_id="model.deploy/deploy-stream", chunk_count=2, envelope_v2=True)
+    registered = client.post(
+        "/v1/model-deployments",
+        json={
+            "deploymentId": "deploy-stream",
+            "sourceType": "LOCAL_WEIGHTS",
+            "upstreamModelId": "tinyllama-test",
+            "timeoutSeconds": 30,
+            "securityProfile": "a100-sim",
+            "simulated": True,
+        },
+    )
+    assert registered.status_code == 200
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.archive = tmp_path / "model-package"
+
+        def prepare_archive(self, _deployment_id: str) -> Path:
+            self.archive.write_bytes(b"")
+            return self.archive
+
+        def append_ciphertext_plaintext(self, _deployment_id: str, plaintext: bytes) -> None:
+            with self.archive.open("ab") as output:
+                output.write(plaintext)
+
+        def start(self, _deployment_id: str, _model_name: str, _timeout: int) -> object:
+            assert self.archive.read_bytes() == b"confidential input 0confidential input 1"
+            return SimpleNamespace(port=19001)
+
+        def endpoint(self, _deployment_id: str) -> str:
+            return "http://127.0.0.1:19001/v1"
+
+        def stop(self, _deployment_id: str, remove_plaintext: bool = True) -> None:
+            if remove_plaintext and self.archive.exists():
+                self.archive.unlink()
+
+        def logs(self, _deployment_id: str) -> str:
+            return "test runtime online"
+
+        def pid(self, _deployment_id: str) -> int:
+            return 4321
+
+    client.app.state.execution_service._runtime = FakeRuntime()
+    chunks = [
+        {
+            "index": index,
+            "format": encrypted["format"],
+            "envelopeId": encrypted["envelopeId"],
+            "implementationVersion": encrypted["implementationVersion"],
+            "algorithm": encrypted["algorithm"],
+            "nonce": encrypted["nonce"],
+            "aad": encrypted["aad"],
+            "ciphertextSha256": encrypted["ciphertextSha256"],
+        }
+        for index, encrypted in enumerate(request["encryptedInputs"])
+    ]
+    prepare = client.post(
+        "/v1/model-deployments/deploy-stream/stream/prepare",
+        json={
+            "taskSpec": request["taskSpec"],
+            "taskSpecDigest": request["taskSpecDigest"],
+            "sessionId": request["sessionId"],
+            "grant": request["grant"],
+            "sealedDek": request["sealedDeks"][0],
+            "assetVersionId": "asset-1@v1",
+            "chunks": chunks,
+        },
+    )
+    assert prepare.status_code == 200, prepare.text
+    for index, encrypted in enumerate(request["encryptedInputs"]):
+        uploaded = client.put(
+            f"/v1/model-deployments/deploy-stream/stream/chunks/{index}",
+            content=unb64u(encrypted["ciphertext"]),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 200, uploaded.text
+    finalized = client.post("/v1/model-deployments/deploy-stream/stream/finalize")
+    assert finalized.status_code == 200, finalized.text
+    assert finalized.json()["status"] == "ONLINE"
+    assert finalized.json()["runtimePort"] == 19001
+    logs = client.get("/v1/model-deployments/deploy-stream/logs")
+    assert logs.json()["logs"] == "test runtime online"
+    replay = client.post(
+        "/v1/model-deployments/deploy-stream/stream/prepare",
+        json={
+            "taskSpec": request["taskSpec"], "taskSpecDigest": request["taskSpecDigest"],
+            "sessionId": request["sessionId"], "grant": request["grant"],
+            "sealedDek": request["sealedDeks"][0], "assetVersionId": "asset-1@v1", "chunks": chunks,
+        },
+    )
+    assert replay.status_code == 400
+    assert replay.json()["error"]["code"] == "GRANT_REPLAYED"
 
 
 def test_model_connector_denies_private_and_non_https_urls() -> None:

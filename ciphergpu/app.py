@@ -14,8 +14,10 @@ from .models import (
     ExecutionRequest,
     ExecutionResponse,
     ModelDeploymentRequest,
+    StreamDeploymentPrepareRequest,
 )
-from .service import CipherGpuError, ConfidentialExecutionService, HttpAttestationIssuer
+from .errors import CipherGpuError
+from .service import ConfidentialExecutionService, HttpAttestationIssuer
 
 
 def create_app(service: ConfidentialExecutionService | None = None) -> FastAPI:
@@ -83,13 +85,33 @@ def create_app(service: ConfidentialExecutionService | None = None) -> FastAPI:
     def get_model_deployment(deployment_id: str) -> dict[str, object]:
         return execution_service.model_deployment(deployment_id)
 
+    @app.get("/v1/model-deployments/{deployment_id}/logs")
+    def get_model_deployment_logs(deployment_id: str) -> dict[str, object]:
+        return execution_service.model_deployment_logs(deployment_id)
+
     @app.post("/v1/model-deployments/{deployment_id}/offline")
     def offline_model_deployment(deployment_id: str) -> dict[str, object]:
         return execution_service.offline_model_deployment(deployment_id)
 
+    @app.post("/v1/model-deployments/{deployment_id}/stream/prepare")
+    def prepare_stream(deployment_id: str, request: StreamDeploymentPrepareRequest) -> dict[str, object]:
+        return execution_service.prepare_stream_deployment(deployment_id, request)
+
+    @app.put("/v1/model-deployments/{deployment_id}/stream/chunks/{index}")
+    async def append_stream_chunk(deployment_id: str, index: int, request: Request) -> dict[str, object]:
+        return execution_service.append_stream_chunk(deployment_id, index, await request.body())
+
+    @app.post("/v1/model-deployments/{deployment_id}/stream/finalize")
+    def finalize_stream(deployment_id: str) -> dict[str, object]:
+        return execution_service.finalize_stream_deployment(deployment_id)
+
     @app.post("/v1/confidential-inference/chat/completions")
     def confidential_inference(request: ConfidentialInferenceRequest) -> dict[str, object]:
         return execution_service.infer(request)
+
+    @app.post("/v1/model-deployments/{deployment_id}/chat/completions")
+    def runtime_chat(deployment_id: str, request: dict[str, object]) -> dict[str, object]:
+        return execution_service.runtime_chat(deployment_id, request)
 
     @app.get("/v1/executions/{execution_id}/receipt")
     def get_receipt(execution_id: str) -> dict[str, object]:

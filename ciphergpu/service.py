@@ -33,6 +33,8 @@ from .crypto import (
     unb64u,
     verify_ed25519,
 )
+from .errors import CipherGpuError
+from .model_runtime import ModelRuntimeManager
 from .models import (
     AttestationRequest,
     AttestationResponse,
@@ -40,15 +42,8 @@ from .models import (
     ExecutionRequest,
     ExecutionResponse,
     ModelDeploymentRequest,
+    StreamDeploymentPrepareRequest,
 )
-
-
-class CipherGpuError(Exception):
-    def __init__(self, code: str, message: str, status: int = 400):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.status = status
 
 
 class AttestationIssuer(Protocol):
@@ -140,6 +135,14 @@ class ModelDeployment:
     error_code: str | None = None
 
 
+@dataclass
+class StreamDeployment:
+    asset_version_id: str
+    dek: bytearray
+    chunks: list[Any]
+    next_index: int = 0
+
+
 class ConfidentialExecutionService:
     def __init__(
         self,
@@ -159,6 +162,8 @@ class ConfidentialExecutionService:
         self._consumed_jti: set[str] = set()
         self._receipts: dict[str, dict[str, Any]] = {}
         self._model_deployments: dict[str, ModelDeployment] = {}
+        self._stream_deployments: dict[str, StreamDeployment] = {}
+        self._runtime = ModelRuntimeManager()
         self._lock = threading.RLock()
 
     def register_model_deployment(self, request: ModelDeploymentRequest) -> dict[str, object]:
@@ -191,6 +196,14 @@ class ConfidentialExecutionService:
             raise CipherGpuError("MODEL_DEPLOYMENT_NOT_FOUND", "model deployment was not registered", 404)
         return self._deployment_view(deployment)
 
+    def model_deployment_logs(self, deployment_id: str) -> dict[str, object]:
+        with self._lock:
+            deployment = self._model_deployments.get(deployment_id)
+        if deployment is None:
+            raise CipherGpuError("MODEL_DEPLOYMENT_NOT_FOUND", "model deployment was not registered", 404)
+        return {"deploymentId": deployment_id, "status": deployment.status,
+                "logs": self._runtime.logs(deployment_id)}
+
     def offline_model_deployment(self, deployment_id: str) -> dict[str, object]:
         with self._lock:
             deployment = self._model_deployments.get(deployment_id)
@@ -208,9 +221,124 @@ class ConfidentialExecutionService:
                     "sessionKeysDestroyed": True,
                 }
             self._clear_deployment_secret(deployment)
+            self._runtime.stop(deployment_id)
+            stream = self._stream_deployments.pop(deployment_id, None)
+            if stream:
+                stream.dek[:] = b"\x00" * len(stream.dek)
             deployment.status = "OFFLINE"
             deployment.session_id = None
         return self._deployment_view(deployment)
+
+    def prepare_stream_deployment(self, deployment_id: str, request: StreamDeploymentPrepareRequest) -> dict[str, object]:
+        self._purge()
+        with self._lock:
+            deployment = self._model_deployments.get(deployment_id)
+            session = self._sessions.get(request.session_id)
+        if deployment is None or deployment.source_type != "LOCAL_WEIGHTS":
+            raise CipherGpuError("MODEL_DEPLOYMENT_NOT_FOUND", "local deployment was not registered", 404)
+        task = request.task_spec.model_dump(by_alias=True)
+        digest = sha256(canonical(task))
+        if digest != request.task_spec_digest or session is None or session.expires_at <= now():
+            raise CipherGpuError("TASK_DIGEST_MISMATCH", "stream task or session is invalid")
+        if (request.task_spec.workload_id != f"model.deploy/{deployment_id}"
+                or request.task_spec.asset_version_ids != [request.asset_version_id]):
+            raise CipherGpuError("GRANT_SCOPE_INVALID", "stream task is not bound to this deployment and asset")
+        if (session.domain_id != request.task_spec.domain_id
+                or request.task_spec.security_profile != "a100-sim"
+                or request.task_spec.evidence_type != "SIMULATED_LAB_V1"
+                or request.task_spec.simulated is not True
+                or request.task_spec.hardware_model != "NVIDIA A100"
+                or request.task_spec.runtime_security_requirement == "gpu-cc"
+                or request.task_spec.workload_digest != self.workload_digest
+                or request.task_spec.policy_digest != self.policy_digest
+                or parse_time(request.task_spec.expires_at) <= now()):
+            raise CipherGpuError("SECURITY_DOWNGRADE_DENIED", "stream task security policy is invalid")
+        if session.task_spec_digest != digest or session.consumed:
+            raise CipherGpuError("GRANT_REPLAYED", "stream authorization was already consumed")
+        claims = request.grant.claims.model_dump(by_alias=True)
+        try:
+            verify_ed25519(request.grant.signing_public_key, request.grant.signature, claims)
+        except (InvalidSignature, ValueError) as failure:
+            raise CipherGpuError("GRANT_SIGNATURE_INVALID", "grant signature is invalid") from failure
+        if claims["taskSpecDigest"] != digest or claims["teeSessionId"] != session.session_id:
+            raise CipherGpuError("GRANT_SCOPE_INVALID", "grant is not bound to the stream session")
+        expected_profile = {
+            "securityProfile": request.task_spec.security_profile,
+            "evidenceType": request.task_spec.evidence_type,
+            "simulated": request.task_spec.simulated,
+            "hardwareModel": request.task_spec.hardware_model,
+            "runtimeSecurityRequirement": request.task_spec.runtime_security_requirement,
+        }
+        if (claims["teeEphemeralPublicKeyHash"] != sha256(session.public_key)
+                or any(claims[key] != value for key, value in expected_profile.items())
+                or claims["outputRecipients"] != request.task_spec.output_recipients
+                or claims["maxUses"] != 1):
+            raise CipherGpuError("GRANT_SCOPE_INVALID", "stream grant security scope is invalid")
+        if parse_time(claims["nbf"]) > now() + timedelta(seconds=30) or parse_time(claims["exp"]) <= now():
+            raise CipherGpuError("GRANT_EXPIRED", "stream grant is outside its validity window")
+        if claims["jti"] in self._consumed_jti:
+            raise CipherGpuError("GRANT_REPLAYED", "stream grant was already consumed")
+        if claims["assetVersionIds"] != [request.asset_version_id] or request.sealed_dek.asset_version_id != request.asset_version_id:
+            raise CipherGpuError("GRANT_SCOPE_INVALID", "grant is not bound to this model version")
+        expected_aad = f"{digest}|{request.asset_version_id}|{claims['grantId']}|{claims['exp']}".encode()
+        if unb64u(request.sealed_dek.aad) != expected_aad:
+            raise CipherGpuError("KEY_MATCH_FAILED", "sealed DEK AAD is invalid")
+        try:
+            dek = bytearray(hpke_open(session.private_key, request.sealed_dek.enc,
+                                     request.sealed_dek.ciphertext, expected_aad, HPKE_DEK_INFO))
+        except (PyHPKEError, ValueError) as failure:
+            raise CipherGpuError("KEY_MATCH_FAILED", "DEK cannot be opened") from failure
+        if len(dek) != 32 or [item.index for item in request.chunks] != list(range(len(request.chunks))):
+            dek[:] = b"\x00" * len(dek)
+            raise CipherGpuError("CONTRACT_INVALID", "DEK or chunk sequence is invalid")
+        self._runtime.prepare_archive(deployment_id)
+        with self._lock:
+            session.consumed = True
+            self._consumed_jti.add(claims["jti"])
+            self._stream_deployments[deployment_id] = StreamDeployment(request.asset_version_id, dek, request.chunks)
+            deployment.status = "DECRYPTING"
+            deployment.session_id = session.session_id
+        return self._deployment_view(deployment)
+
+    def append_stream_chunk(self, deployment_id: str, index: int, ciphertext: bytes) -> dict[str, object]:
+        with self._lock:
+            state = self._stream_deployments.get(deployment_id)
+        if state is None or index != state.next_index:
+            raise CipherGpuError("CONTRACT_INVALID", "unexpected model chunk index")
+        metadata = state.chunks[index]
+        if sha256(ciphertext) != metadata.ciphertext_sha256:
+            raise CipherGpuError("DATA_INTEGRITY_FAILED", "model chunk digest mismatch")
+        try:
+            plaintext = content_open(bytes(state.dek), metadata.envelope_id, metadata.algorithm,
+                                     metadata.nonce, b64u(ciphertext), metadata.aad,
+                                     metadata.implementation_version)
+            self._runtime.append_ciphertext_plaintext(deployment_id, plaintext)
+            state.next_index += 1
+            return {"deploymentId": deployment_id, "index": index, "status": "DECRYPTED"}
+        except Exception as failure:
+            raise CipherGpuError("DATA_INTEGRITY_FAILED", "model chunk authentication failed") from failure
+
+    def finalize_stream_deployment(self, deployment_id: str) -> dict[str, object]:
+        with self._lock:
+            state = self._stream_deployments.get(deployment_id)
+            deployment = self._model_deployments.get(deployment_id)
+        if state is None or deployment is None or state.next_index != len(state.chunks):
+            raise CipherGpuError("CONTRACT_INVALID", "model stream is incomplete")
+        deployment.status = "LOADING"
+        try:
+            runtime = self._runtime.start(deployment_id, deployment.upstream_model_id, deployment.timeout_seconds)
+            deployment.base_url = f"http://127.0.0.1:{runtime.port}/v1"
+            deployment.status = "ONLINE"
+            deployment.error_code = None
+            return self._deployment_view(deployment)
+        except CipherGpuError as failure:
+            deployment.status = "FAILED"
+            deployment.error_code = failure.code
+            self._runtime.stop(deployment_id)
+            raise
+        finally:
+            state.dek[:] = b"\x00" * len(state.dek)
+            self._stream_deployments.pop(deployment_id, None)
 
     def create_session(self, request: AttestationRequest) -> AttestationResponse:
         self._purge()
@@ -545,6 +673,24 @@ class ConfidentialExecutionService:
             if "request_key" in locals():
                 request_key[:] = b"\x00" * len(request_key)
 
+    def runtime_chat(self, deployment_id: str, payload: dict[str, Any]) -> dict[str, object]:
+        """Trusted control-plane proxy for an already-authorized local runtime.
+
+        This endpoint is only exposed on CipherGPU's mTLS listener.  Customer
+        bearer keys are validated by SecretPad before a request reaches here.
+        """
+        with self._lock:
+            deployment = self._model_deployments.get(deployment_id)
+        local_runtime_missing = (deployment is not None and deployment.source_type == "LOCAL_WEIGHTS"
+                                 and not self._runtime.endpoint(deployment_id))
+        if deployment is None or deployment.status != "ONLINE" or local_runtime_missing:
+            raise CipherGpuError("MODEL_NOT_ONLINE", "model deployment is not online", 503)
+        if not isinstance(payload.get("messages"), list):
+            raise CipherGpuError("CONTRACT_INVALID", "chat request requires messages")
+        payload = dict(payload)
+        payload["model"] = deployment.upstream_model_id
+        return self._invoke_model(deployment, payload)
+
     def _activate_model_deployment(
         self, request: ExecutionRequest, plaintexts: list[bytes]
     ) -> str | None:
@@ -569,12 +715,20 @@ class ConfidentialExecutionService:
                 deployment.secret = bytearray(plaintexts[0])
                 deployment.status = "ONLINE"
                 deployment.error_code = None
-            elif deployment.base_url:
+            else:
+                # The existing execution contract supplies decrypted bytes.  The
+                # control plane's streaming path writes the same archive without
+                # retaining it in browser memory; this fallback keeps old small
+                # package clients compatible while using the real runtime.
+                archive = self._runtime.prepare_archive(deployment_id)
+                with archive.open("wb") as output:
+                    for plaintext in plaintexts:
+                        output.write(plaintext)
+                runtime = self._runtime.start(deployment_id, deployment.upstream_model_id,
+                                              deployment.timeout_seconds)
+                deployment.base_url = f"http://127.0.0.1:{runtime.port}/v1"
                 deployment.status = "ONLINE"
                 deployment.error_code = None
-            else:
-                deployment.status = "RUNTIME_REQUIRED"
-                deployment.error_code = "VLLM_ENDPOINT_NOT_CONFIGURED"
             deployment.session_id = request.session_id
             return deployment.status
 
@@ -627,6 +781,7 @@ class ConfidentialExecutionService:
             raise CipherGpuError("MODEL_PROVIDER_URL_DENIED", "model provider URL is not allowed") from failure
 
     def _deployment_view(self, deployment: ModelDeployment) -> dict[str, object]:
+        runtime_endpoint = self._runtime.endpoint(deployment.deployment_id)
         return {
             "deploymentId": deployment.deployment_id,
             "sourceType": deployment.source_type,
@@ -636,6 +791,9 @@ class ConfidentialExecutionService:
             "status": deployment.status,
             "sessionId": deployment.session_id,
             "errorCode": deployment.error_code,
+            "runtimeActive": runtime_endpoint is not None,
+            "runtimePid": self._runtime.pid(deployment.deployment_id),
+            "runtimePort": int(runtime_endpoint.rsplit(":", 1)[1].split("/", 1)[0]) if runtime_endpoint else None,
         }
 
     def _clear_deployment_secret(self, deployment: ModelDeployment) -> None:

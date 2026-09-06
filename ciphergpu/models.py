@@ -168,6 +168,27 @@ class ModelDeploymentRequest(StrictModel):
     simulated: Literal[True]
 
 
+class StreamChunkMetadata(StrictModel):
+    index: int = Field(ge=0)
+    format: Literal["ds-envelope/v2"]
+    envelope_id: str = Field(alias="envelopeId", min_length=1)
+    implementation_version: Literal["1"] = Field(alias="implementationVersion")
+    algorithm: ContentEncryptionAlgorithm
+    nonce: str
+    aad: dict[str, Any]
+    ciphertext_sha256: str = Field(alias="ciphertextSha256", pattern=r"^[0-9a-f]{64}$")
+
+
+class StreamDeploymentPrepareRequest(StrictModel):
+    task_spec: TaskSpec = Field(alias="taskSpec")
+    task_spec_digest: str = Field(alias="taskSpecDigest", pattern=r"^[0-9a-f]{64}$")
+    session_id: str = Field(alias="sessionId")
+    grant: SignedGrant
+    sealed_dek: SealedDek = Field(alias="sealedDek")
+    asset_version_id: str = Field(alias="assetVersionId")
+    chunks: list[StreamChunkMetadata] = Field(min_length=1)
+
+
 class SealedRequestKey(StrictModel):
     enc: str
     ciphertext: str
