@@ -61,6 +61,8 @@ class AttestationIssuer(Protocol):
 
     def sign_receipt(self, payload: Any) -> str: ...
 
+    def sign_manifest(self, payload: Any) -> str: ...
+
 
 class HttpAttestationIssuer:
     """Client for the separately deployed, simulation-only attestation signer."""
@@ -101,6 +103,9 @@ class HttpAttestationIssuer:
 
     def sign_receipt(self, payload: Any) -> str:
         return self._sign("/v1/receipts/sign", payload)
+
+    def sign_manifest(self, payload: Any) -> str:
+        return self._sign("/v1/manifests/sign", payload)
 
 
 def now() -> datetime:
@@ -737,7 +742,7 @@ class ConfidentialExecutionService:
             job.status = "OUTPUT_READY"
             job.progress = 99
         except Exception as failure:
-            self._fail_training_job(job, getattr(failure, "code", "TRAINING_WORKER_FAILED"))
+            self._fail_training_job(job, getattr(failure, "code", "TRAINING_OUTPUT_FAILED"))
 
     def _encrypt_training_output(
         self, job: TrainingJob, slot: str, source_name: str
@@ -849,7 +854,7 @@ class ConfidentialExecutionService:
                 "trainingConfigHash": sha256(canonical(job.training_config)),
                 "runtimeReceipt": (job.metrics or {}).get("runtime", {}),
             }
-            manifest["producerSignature"] = self.signer.sign_receipt(manifest)
+            manifest["producerSignature"] = self.signer.sign_manifest(manifest)
             return TrainingOutputState(manifest, paths)
         finally:
             dek[:] = b"\x00" * len(dek)

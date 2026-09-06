@@ -83,6 +83,36 @@ def validate_receipt(receipt: dict[str, Any]) -> None:
         raise HTTPException(status_code=400, detail="invalid model deployment status")
 
 
+def validate_training_manifest(manifest: dict[str, Any]) -> None:
+    required = {
+        "format": "ds-envelope/v2",
+        "producerType": "CIPHERGPU",
+        "producerNodeId": "ciphergpu",
+    }
+    if any(manifest.get(key) != value for key, value in required.items()):
+        raise HTTPException(status_code=400, detail="invalid CipherGPU output manifest")
+    for field in (
+        "taskId",
+        "outputId",
+        "assetType",
+        "recipientKid",
+        "envelopeId",
+        "trainingConfigHash",
+    ):
+        if not manifest.get(field):
+            raise HTTPException(status_code=400, detail=f"missing output manifest field: {field}")
+    if manifest.get("assetType") not in {"RESULT_MODEL", "RESULT_DATA"}:
+        raise HTTPException(status_code=400, detail="invalid output asset type")
+    if not isinstance(manifest.get("chunks"), list) or not manifest["chunks"]:
+        raise HTTPException(status_code=400, detail="output manifest requires chunks")
+    envelope = manifest.get("keyEnvelope")
+    if not isinstance(envelope, dict) or envelope.get("recipientKid") != manifest.get("recipientKid"):
+        raise HTTPException(status_code=400, detail="output key envelope recipient mismatch")
+    runtime = manifest.get("runtimeReceipt")
+    if not isinstance(runtime, dict) or not runtime.get("gpuName") or not runtime.get("globalSteps"):
+        raise HTTPException(status_code=400, detail="output manifest requires GPU runtime receipt")
+
+
 @app.get("/v1/health")
 def health() -> dict[str, Any]:
     return {
@@ -109,6 +139,16 @@ def sign(request: SignRequest) -> dict[str, str]:
 @app.post("/v1/receipts/sign")
 def sign_receipt(request: SignRequest) -> dict[str, str]:
     validate_receipt(request.payload)
+    return {
+        "evidenceDigest": sha256(__import__("rfc8785").dumps(request.payload)),
+        "evidenceSignature": signer.sign(request.payload),
+        "evidenceSigningPublicKey": signer.public_key,
+    }
+
+
+@app.post("/v1/manifests/sign")
+def sign_manifest(request: SignRequest) -> dict[str, str]:
+    validate_training_manifest(request.payload)
     return {
         "evidenceDigest": sha256(__import__("rfc8785").dumps(request.payload)),
         "evidenceSignature": signer.sign(request.payload),

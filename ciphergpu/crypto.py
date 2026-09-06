@@ -229,6 +229,9 @@ class EvidenceSigner:
     def sign_receipt(self, payload: Any) -> str:
         return self.sign(payload)
 
+    def sign_manifest(self, payload: Any) -> str:
+        return self.sign(payload)
+
     def private_bytes(self) -> bytes:
         return self._private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
 
