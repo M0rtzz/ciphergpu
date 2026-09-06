@@ -189,6 +189,34 @@ class StreamDeploymentPrepareRequest(StrictModel):
     chunks: list[StreamChunkMetadata] = Field(min_length=1)
 
 
+class TrainingInputSpec(StrictModel):
+    slot: Literal["model", "train-data", "validation-data"]
+    asset_version_id: str = Field(alias="assetVersionId", min_length=1, max_length=160)
+    package_format: Literal["ZIP", "TAR", "TAR_GZ"] = Field(alias="packageFormat")
+    manifest_hash: str = Field(alias="manifestHash", pattern=r"^[0-9a-f]{64}$")
+    manifest: dict[str, Any]
+    owner_signing_public_key: str = Field(alias="ownerSigningPublicKey")
+    owner_signature: str = Field(alias="ownerSignature")
+    sealed_dek: SealedDek = Field(alias="sealedDek")
+    chunks: list[StreamChunkMetadata] = Field(min_length=1)
+
+
+class TrainingJobPrepareRequest(StrictModel):
+    job_id: str = Field(alias="jobId", min_length=1, max_length=128)
+    task_spec: TaskSpec = Field(alias="taskSpec")
+    task_spec_digest: str = Field(alias="taskSpecDigest", pattern=r"^[0-9a-f]{64}$")
+    session_id: str = Field(alias="sessionId")
+    grants: list[SignedGrant] = Field(min_length=1)
+    inputs: list[TrainingInputSpec] = Field(min_length=2, max_length=3)
+    output_recipient: OutputRecipient = Field(alias="outputRecipient")
+    adapter_id: Literal[
+        "hf-sequence-classification-v1",
+        "hf-causal-lm-sft-lora-v1",
+    ] = Field(alias="adapterId")
+    training_config: dict[str, Any] = Field(alias="trainingConfig")
+    training_config_hash: str = Field(alias="trainingConfigHash", pattern=r"^[0-9a-f]{64}$")
+
+
 class SealedRequestKey(StrictModel):
     enc: str
     ciphertext: str

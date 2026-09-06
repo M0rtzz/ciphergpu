@@ -25,6 +25,7 @@ HPKE_ALGORITHM = "HPKE-Base-X25519-HKDF-SHA256-AES-256-GCM"
 HPKE_DEK_INFO = b"ds-confidential/v1/dek"
 HPKE_ODK_INFO = b"ds-confidential/v1/odk"
 HPKE_REQUEST_KEY_INFO = b"ds-confidential/v1/inference-request-key"
+HPKE_RESULT_DEK_INFO = b"ds-confidential/v1/result-dek"
 
 CONTENT_ENCRYPTION_ALGORITHMS = {
     "AES-256-GCM": {"keySize": 32, "nonceSize": 12, "tagSize": 16},

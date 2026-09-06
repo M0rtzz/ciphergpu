@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -15,6 +16,7 @@ from .models import (
     ExecutionResponse,
     ModelDeploymentRequest,
     StreamDeploymentPrepareRequest,
+    TrainingJobPrepareRequest,
 )
 from .errors import CipherGpuError
 from .service import ConfidentialExecutionService, HttpAttestationIssuer
@@ -37,7 +39,18 @@ def create_app(service: ConfidentialExecutionService | None = None) -> FastAPI:
         execution_service = ConfidentialExecutionService(
             EvidenceSigner.load(os.environ.get("CIPHERGPU_EVIDENCE_SIGNING_KEY"))
         )
-    app = FastAPI(title="CipherGPU", version=__version__, docs_url=None, redoc_url=None)
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        yield
+        execution_service.close()
+
+    app = FastAPI(
+        title="CipherGPU",
+        version=__version__,
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
     app.state.execution_service = execution_service
 
     @app.exception_handler(CipherGpuError)
@@ -104,6 +117,53 @@ def create_app(service: ConfidentialExecutionService | None = None) -> FastAPI:
     @app.post("/v1/model-deployments/{deployment_id}/stream/finalize")
     def finalize_stream(deployment_id: str) -> dict[str, object]:
         return execution_service.finalize_stream_deployment(deployment_id)
+
+    @app.post("/v1/training-jobs")
+    def prepare_training_job(request: TrainingJobPrepareRequest) -> dict[str, object]:
+        return execution_service.prepare_training_job(request)
+
+    @app.put("/v1/training-jobs/{job_id}/inputs/{slot}/chunks/{index}")
+    async def append_training_input(
+        job_id: str, slot: str, index: int, request: Request
+    ) -> dict[str, object]:
+        return execution_service.append_training_input(job_id, slot, index, await request.body())
+
+    @app.post("/v1/training-jobs/{job_id}/inputs/{slot}/finalize")
+    def finalize_training_input(job_id: str, slot: str) -> dict[str, object]:
+        return execution_service.finalize_training_input(job_id, slot)
+
+    @app.post("/v1/training-jobs/{job_id}/start")
+    def start_training_job(job_id: str) -> dict[str, object]:
+        return execution_service.start_training_job(job_id)
+
+    @app.get("/v1/training-jobs/{job_id}")
+    def get_training_job(job_id: str) -> dict[str, object]:
+        return execution_service.training_job(job_id)
+
+    @app.get("/v1/training-jobs/{job_id}/logs")
+    def get_training_logs(job_id: str) -> dict[str, object]:
+        return execution_service.training_logs(job_id)
+
+    @app.post("/v1/training-jobs/{job_id}/cancel")
+    def cancel_training_job(job_id: str) -> dict[str, object]:
+        return execution_service.cancel_training_job(job_id)
+
+    @app.get("/v1/training-jobs/{job_id}/outputs")
+    def get_training_outputs(job_id: str) -> dict[str, object]:
+        return execution_service.training_outputs(job_id)
+
+    @app.get("/v1/training-jobs/{job_id}/outputs/{slot}/chunks/{index}")
+    def get_training_output_chunk(job_id: str, slot: str, index: int):
+        from fastapi.responses import Response
+
+        return Response(
+            execution_service.training_output_chunk(job_id, slot, index),
+            media_type="application/octet-stream",
+        )
+
+    @app.post("/v1/training-jobs/{job_id}/outputs/ack")
+    def acknowledge_training_outputs(job_id: str) -> dict[str, object]:
+        return execution_service.acknowledge_training_outputs(job_id)
 
     @app.post("/v1/confidential-inference/chat/completions")
     def confidential_inference(request: ConfidentialInferenceRequest) -> dict[str, object]:

@@ -13,7 +13,7 @@ RUN groupadd --system --gid 10001 ciphergpu \
 WORKDIR /app
 COPY --chown=ciphergpu:ciphergpu pyproject.toml README.md ./
 COPY --chown=ciphergpu:ciphergpu ciphergpu ./ciphergpu
-RUN pip install .
+RUN pip install ".[training]"
 
 USER 10001:10001
 EXPOSE 9000
