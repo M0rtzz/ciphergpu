@@ -98,6 +98,7 @@ class SignedGrant(StrictModel):
 
 class SealedDek(StrictModel):
     asset_version_id: str = Field(alias="assetVersionId")
+    algorithm: Literal["HPKE-Base-X25519-HKDF-SHA256-AES-256-GCM"] | None = None
     enc: str
     ciphertext: str
     aad: str
