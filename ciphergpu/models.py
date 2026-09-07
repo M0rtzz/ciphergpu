@@ -5,6 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 ContentEncryptionAlgorithm = Literal[
+    "SM4-GCM",
     "AES-256-GCM",
     "AES-256-GCM-SIV",
     "CHACHA20-POLY1305",

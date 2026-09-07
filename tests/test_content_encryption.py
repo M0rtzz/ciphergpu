@@ -17,6 +17,7 @@ from ciphergpu.crypto import (
 )
 
 CROSS_LANGUAGE_VECTORS = {
+    "SM4-GCM": "4658b6c6f010881eec7ca35462bd33fb7d61d1c3887baef4e7485b9025f77c13ba2074ec054a46",
     "AES-256-GCM": "61f9a60cec802ae73257be02c2e77cea9111e907ad9bab33b5f949207034741a36d3424f118396",
     "AES-256-GCM-SIV": "9f26ddc094d050f8d8f660c4a454807370f997d33cfa654e42145648447fac8807826412f0f07b",
     "CHACHA20-POLY1305": "41b89493ec73b56bfa32176f8b23a5cd382dafaa279f232305e00832b4a5c20b94820a0dfe178b",
@@ -72,7 +73,7 @@ def test_unknown_algorithm_and_nonce_length_fail_closed() -> None:
         content_seal(os.urandom(32), "env-1", "AES-256-GCM", os.urandom(8), b"data", {})
 
 
-def test_capabilities_publish_five_authenticated_algorithms() -> None:
+def test_capabilities_publish_authenticated_algorithms() -> None:
     response = TestClient(create_app()).get("/v1/crypto/capabilities")
     assert response.status_code == 200
     body = response.json()

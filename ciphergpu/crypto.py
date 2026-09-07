@@ -11,6 +11,7 @@ from typing import Any
 import rfc8785
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, AESGCMSIV, AESSIV, ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
@@ -27,6 +28,7 @@ HPKE_ODK_INFO = b"ds-confidential/v1/odk"
 HPKE_REQUEST_KEY_INFO = b"ds-confidential/v1/inference-request-key"
 
 CONTENT_ENCRYPTION_ALGORITHMS = {
+    "SM4-GCM": {"keySize": 16, "nonceSize": 12, "tagSize": 16},
     "AES-256-GCM": {"keySize": 32, "nonceSize": 12, "tagSize": 16},
     "AES-256-GCM-SIV": {"keySize": 32, "nonceSize": 12, "tagSize": 16},
     "CHACHA20-POLY1305": {"keySize": 32, "nonceSize": 12, "tagSize": 16},
@@ -140,6 +142,10 @@ def content_seal(
     key = bytearray(derive_content_key(dek, envelope_id, algorithm, implementation_version))
     aad_bytes = canonical(aad)
     try:
+        if algorithm == "SM4-GCM":
+            encryptor = Cipher(algorithms.SM4(bytes(key)), modes.GCM(nonce)).encryptor()
+            encryptor.authenticate_additional_data(aad_bytes)
+            return encryptor.update(plaintext) + encryptor.finalize() + encryptor.tag
         if algorithm == "AES-256-GCM":
             return AESGCM(bytes(key)).encrypt(nonce, plaintext, aad_bytes)
         if algorithm == "AES-256-GCM-SIV":
@@ -172,6 +178,12 @@ def content_open(
     aad_bytes = canonical(aad)
     ciphertext_bytes = unb64u(ciphertext)
     try:
+        if algorithm == "SM4-GCM":
+            if len(ciphertext_bytes) < 16:
+                raise ValueError("SM4-GCM ciphertext is shorter than the authentication tag")
+            decryptor = Cipher(algorithms.SM4(bytes(key)), modes.GCM(nonce_bytes, ciphertext_bytes[-16:])).decryptor()
+            decryptor.authenticate_additional_data(aad_bytes)
+            return decryptor.update(ciphertext_bytes[:-16]) + decryptor.finalize()
         if algorithm == "AES-256-GCM":
             return AESGCM(bytes(key)).decrypt(nonce_bytes, ciphertext_bytes, aad_bytes)
         if algorithm == "AES-256-GCM-SIV":
